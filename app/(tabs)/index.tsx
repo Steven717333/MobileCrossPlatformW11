@@ -1,98 +1,419 @@
-import { Image } from 'expo-image';
-import { Platform, StyleSheet } from 'react-native';
+import React, { useState } from 'react'
 
-import { HelloWave } from '@/components/hello-wave';
-import ParallaxScrollView from '@/components/parallax-scroll-view';
-import { ThemedText } from '@/components/themed-text';
-import { ThemedView } from '@/components/themed-view';
-import { Link } from 'expo-router';
+import {
+  Alert,
+  Button,
+  Dimensions,
+  Image,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native'
 
-export default function HomeScreen() {
-  return (
-    <ParallaxScrollView
-      headerBackgroundColor={{ light: '#A1CEDC', dark: '#1D3D47' }}
-      headerImage={
-        <Image
-          source={require('@/assets/images/partial-react-logo.png')}
-          style={styles.reactLogo}
-        />
-      }>
-      <ThemedView style={styles.titleContainer}>
-        <ThemedText type="title">Welcome!</ThemedText>
-        <HelloWave />
-      </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <ThemedText type="subtitle">Step 1: Try it</ThemedText>
-        <ThemedText>
-          Edit <ThemedText type="defaultSemiBold">app/(tabs)/index.tsx</ThemedText> to see changes.
-          Press{' '}
-          <ThemedText type="defaultSemiBold">
-            {Platform.select({
-              ios: 'cmd + d',
-              android: 'cmd + m',
-              web: 'F12',
-            })}
-          </ThemedText>{' '}
-          to open developer tools.
-        </ThemedText>
-      </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <Link href="/modal">
-          <Link.Trigger>
-            <ThemedText type="subtitle">Step 2: Explore</ThemedText>
-          </Link.Trigger>
-          <Link.Preview />
-          <Link.Menu>
-            <Link.MenuAction title="Action" icon="cube" onPress={() => alert('Action pressed')} />
-            <Link.MenuAction
-              title="Share"
-              icon="square.and.arrow.up"
-              onPress={() => alert('Share pressed')}
-            />
-            <Link.Menu title="More" icon="ellipsis">
-              <Link.MenuAction
-                title="Delete"
-                icon="trash"
-                destructive
-                onPress={() => alert('Delete pressed')}
-              />
-            </Link.Menu>
-          </Link.Menu>
-        </Link>
+import * as FileSystem from 'expo-file-system/legacy'
+import * as ImagePicker from 'expo-image-picker'
+import * as Location from 'expo-location'
 
-        <ThemedText>
-          {`Tap the Explore tab to learn more about what's included in this starter app.`}
-        </ThemedText>
-      </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <ThemedText type="subtitle">Step 3: Get a fresh start</ThemedText>
-        <ThemedText>
-          {`When you're ready, run `}
-          <ThemedText type="defaultSemiBold">npm run reset-project</ThemedText> to get a fresh{' '}
-          <ThemedText type="defaultSemiBold">app</ThemedText> directory. This will move the current{' '}
-          <ThemedText type="defaultSemiBold">app</ThemedText> to{' '}
-          <ThemedText type="defaultSemiBold">app-example</ThemedText>.
-        </ThemedText>
-      </ThemedView>
-    </ParallaxScrollView>
-  );
+import { decode } from 'base64-arraybuffer'
+
+import MapView, {
+  Marker,
+  Region,
+  UrlTile,
+} from 'react-native-maps'
+
+import { supabase } from '../../lib/supabase'
+
+type Coordinates = {
+  latitude: number
+  longitude: number
 }
 
+const { height } = Dimensions.get('window')
+
+const HomeScreen = () => {
+
+  const [location, setLocation] =
+    useState<Coordinates | null>(null)
+
+  const [marker, setMarker] =
+    useState<Coordinates | null>(null)
+
+  const [image, setImage] =
+    useState<string | null>(null)
+
+  // =========================
+  // GET LOCATION
+  // =========================
+
+  const getLocation = async () => {
+
+    try {
+
+      const { status } =
+        await Location.requestForegroundPermissionsAsync()
+
+      if (status !== 'granted') {
+
+        Alert.alert(
+          'Permission denied',
+          'Please allow location access'
+        )
+
+        return
+      }
+
+      const loc =
+        await Location.getCurrentPositionAsync()
+
+      const coords = {
+        latitude: loc.coords.latitude,
+        longitude: loc.coords.longitude,
+      }
+
+      setLocation(coords)
+      setMarker(coords)
+
+    } catch (error: any) {
+
+      Alert.alert(
+        'Error',
+        error.message
+      )
+    }
+  }
+
+  // =========================
+  // OPEN CAMERA
+  // =========================
+
+  const openCamera = async () => {
+
+    try {
+
+      const permission =
+        await ImagePicker.requestCameraPermissionsAsync()
+
+      if (!permission.granted) {
+
+        Alert.alert(
+          'Permission denied',
+          'Camera permission required'
+        )
+
+        return
+      }
+
+      const result =
+        await ImagePicker.launchCameraAsync({
+          mediaTypes: ['images'],
+          quality: 1,
+        })
+
+      if (!result.canceled) {
+
+        setImage(result.assets[0].uri)
+      }
+
+    } catch (error: any) {
+
+      Alert.alert(
+        'Error',
+        error.message
+      )
+    }
+  }
+
+  // =========================
+  // SAVE TO SUPABASE
+  // =========================
+
+  const saveData = async () => {
+
+    try {
+
+      if (!image) {
+
+        Alert.alert(
+          'Error',
+          'Please take a photo first'
+        )
+
+        return
+      }
+
+      if (!marker) {
+
+        Alert.alert(
+          'Error',
+          'Location not found'
+        )
+
+        return
+      }
+
+      // Read image as base64
+
+      const base64 =
+        await FileSystem.readAsStringAsync(
+          image,
+          {
+            encoding: 'base64',
+          }
+        )
+
+      // File name
+
+      const fileName =
+        `photo_${Date.now()}.jpg`
+
+      // Upload to storage
+
+      const { error: uploadError } =
+        await supabase.storage
+          .from('photos')
+          .upload(
+            fileName,
+            decode(base64),
+            {
+              contentType: 'image/jpeg',
+            }
+          )
+
+      if (uploadError)
+        throw uploadError
+
+      // Get public URL
+
+      const { data: publicUrlData } =
+        supabase.storage
+          .from('photos')
+          .getPublicUrl(fileName)
+
+      const imageUrl =
+        publicUrlData.publicUrl
+
+      // Save to database
+
+      const { error: dbError } =
+        await supabase
+          .from('photos')
+          .insert([
+            {
+              image_url: imageUrl,
+              latitude: marker.latitude,
+              longitude: marker.longitude,
+            },
+          ])
+
+      if (dbError)
+        throw dbError
+
+      Alert.alert(
+        'Success',
+        'Photo and location saved successfully'
+      )
+
+    } catch (error: any) {
+
+      Alert.alert(
+        'Error',
+        error.message
+      )
+    }
+  }
+
+  const region: Region | undefined =
+    location
+      ? {
+        latitude: location.latitude,
+        longitude: location.longitude,
+        latitudeDelta: 0.01,
+        longitudeDelta: 0.01,
+      }
+      : undefined
+
+  return (
+    <View style={styles.container}>
+
+      {!location ? (
+
+        <View style={styles.center}>
+
+          <Text style={styles.title}>
+            Supabase Camera & Maps
+          </Text>
+
+          <Button
+            title="Get Geo Location"
+            onPress={getLocation}
+          />
+
+        </View>
+
+      ) : (
+
+        <>
+
+          <MapView
+            style={styles.map}
+            initialRegion={region}
+
+            onPress={(e) => {
+              setMarker(
+                e.nativeEvent.coordinate
+              )
+            }}
+          >
+
+            <UrlTile
+              urlTemplate="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+            />
+
+            {marker && (
+
+              <Marker
+                coordinate={marker}
+                title="Photo Location"
+                draggable
+
+                onDragEnd={(e) => {
+                  setMarker(
+                    e.nativeEvent.coordinate
+                  )
+                }}
+              />
+
+            )}
+
+          </MapView>
+
+          <ScrollView style={styles.info}>
+
+            <Text style={styles.text}>
+              Device Location
+            </Text>
+
+            <Text>
+              Latitude:
+              {' '}
+              {location.latitude}
+            </Text>
+
+            <Text>
+              Longitude:
+              {' '}
+              {location.longitude}
+            </Text>
+
+            <Text
+              style={[
+                styles.text,
+                { marginTop: 10 },
+              ]}
+            >
+              Marker Position
+            </Text>
+
+            <Text>
+              Latitude:
+              {' '}
+              {marker?.latitude}
+            </Text>
+
+            <Text>
+              Longitude:
+              {' '}
+              {marker?.longitude}
+            </Text>
+
+            <View style={styles.button}>
+
+              <Button
+                title="Open Camera"
+                onPress={openCamera}
+              />
+
+            </View>
+
+            <View style={styles.button}>
+
+              <Button
+                title="Save To Supabase"
+                onPress={saveData}
+              />
+
+            </View>
+
+            {image && (
+
+              <Image
+                source={{ uri: image }}
+                style={styles.image}
+              />
+
+            )}
+
+          </ScrollView>
+
+        </>
+
+      )}
+
+    </View>
+  )
+}
+
+export default HomeScreen
+
 const styles = StyleSheet.create({
-  titleContainer: {
-    flexDirection: 'row',
+
+  container: {
+    flex: 1,
+    backgroundColor: '#f5f7fb',
+  },
+
+  center: {
+    flex: 1,
+    justifyContent: 'center',
     alignItems: 'center',
-    gap: 8,
+    padding: 24,
   },
-  stepContainer: {
-    gap: 8,
-    marginBottom: 8,
+
+  title: {
+    fontSize: 22,
+    fontWeight: '700',
+    marginBottom: 20,
+    color: '#1f2937',
   },
-  reactLogo: {
-    height: 178,
-    width: 290,
-    bottom: 0,
-    left: 0,
-    position: 'absolute',
+
+  map: {
+    width: '100%',
+    height: height * 0.5,
   },
-});
+
+  info: {
+    flex: 1,
+    padding: 16,
+    backgroundColor: '#fff',
+  },
+
+  text: {
+    fontSize: 16,
+    fontWeight: '600',
+  },
+
+  button: {
+    marginTop: 10,
+  },
+
+  image: {
+    width: 220,
+    height: 220,
+    marginTop: 15,
+    borderRadius: 10,
+    alignSelf: 'center',
+  },
+
+})
