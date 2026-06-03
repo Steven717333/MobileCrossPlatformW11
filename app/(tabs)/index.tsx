@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   Alert,
   Button,
@@ -9,13 +9,23 @@ import {
   Text,
   View,
 } from 'react-native';
+import { WebView } from 'react-native-webview';
 
 import * as FileSystem from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
 import * as Location from 'expo-location';
 
 import { decode } from 'base64-arraybuffer';
-import MapView, { Marker, Region, UrlTile } from 'react-native-maps';
+
+import { useSelector } from 'react-redux';
+import { useAppDispatch } from '@/store/hooks';
+import { RootState } from '@/store/store';
+import {
+  incrementFirestoreSuccess,
+  incrementFirestoreFailed,
+  incrementFcmSuccess,
+  incrementFcmFailed,
+} from '@/store/firebaseStats.slice';
 
 import { supabase } from '../../lib/supabase';
 import { sendLocalNotification } from '@/lib/notifications';
@@ -27,11 +37,60 @@ type Coordinates = {
 
 const { height } = Dimensions.get('window');
 
+const buildLeafletHTML = (lat: number, lng: number) => `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    * { margin: 0; padding: 0; }
+    #map { width: 100vw; height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script>
+    var map = L.map('map').setView([${lat}, ${lng}], 15);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap contributors',
+      maxZoom: 19
+    }).addTo(map);
+
+    var marker = L.marker([${lat}, ${lng}], { draggable: true }).addTo(map);
+
+    function sendCoords(lat, lng) {
+      window.ReactNativeWebView.postMessage(JSON.stringify({ latitude: lat, longitude: lng }));
+    }
+
+    sendCoords(${lat}, ${lng});
+
+    marker.on('dragend', function(e) {
+      var pos = e.target.getLatLng();
+      sendCoords(pos.lat, pos.lng);
+    });
+
+    map.on('click', function(e) {
+      marker.setLatLng(e.latlng);
+      sendCoords(e.latlng.lat, e.latlng.lng);
+    });
+  </script>
+</body>
+</html>
+`;
+
 const HomeScreen = () => {
   const [location, setLocation] = useState<Coordinates | null>(null);
   const [marker, setMarker] = useState<Coordinates | null>(null);
   const [image, setImage] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  const dispatch = useAppDispatch();
+  const firestoreSuccess = useSelector((state: RootState) => state.firebaseStats.firestoreSuccess);
+  const firestoreFailed = useSelector((state: RootState) => state.firebaseStats.firestoreFailed);
+  const fcmSuccess = useSelector((state: RootState) => state.firebaseStats.fcmSuccess);
+  const fcmFailed = useSelector((state: RootState) => state.firebaseStats.fcmFailed);
 
   // GET LOCATION
   const getLocation = async () => {
@@ -73,93 +132,73 @@ const HomeScreen = () => {
     }
   };
 
-  // SAVE DATA ke Supabase + kirim Push Notification via Firebase
+  // SAVE DATA + Redux stats
   const saveData = async () => {
-    if (!image) {
-      Alert.alert('Error', 'Please take a photo first');
-      return;
-    }
-    if (!marker) {
-      Alert.alert('Error', 'Location not found');
-      return;
-    }
-
+    if (!image || !marker) return;
     setLoading(true);
 
+    let firestoreOk = false;
+
     try {
-      // Baca foto sebagai base64
       const base64 = await FileSystem.readAsStringAsync(image, {
         encoding: 'base64',
       });
 
       const fileName = `photo_${Date.now()}.jpg`;
 
-      // Upload ke Supabase Storage
       const { error: uploadError } = await supabase.storage
         .from('photos')
         .upload(fileName, decode(base64), { contentType: 'image/jpeg' });
 
       if (uploadError) throw uploadError;
 
-      // Ambil public URL
       const { data: publicUrlData } = supabase.storage
         .from('photos')
         .getPublicUrl(fileName);
 
-      const imageUrl = publicUrlData.publicUrl;
-
-      // Simpan ke Supabase Database
       const { error: dbError } = await supabase
         .from('photos')
         .insert([{
-          image_url: imageUrl,
+          image_url: publicUrlData.publicUrl,
           latitude: marker.latitude,
           longitude: marker.longitude,
         }]);
 
       if (dbError) throw dbError;
 
-      // Kirim notifikasi sukses via Firebase
+      dispatch(incrementFirestoreSuccess());
+      firestoreOk = true;
+    } catch {
+      dispatch(incrementFirestoreFailed());
+      firestoreOk = false;
+    }
+
+    try {
+      const fsSuccess = firestoreOk ? firestoreSuccess + 1 : firestoreSuccess;
+      const fsFailed = firestoreOk ? firestoreFailed : firestoreFailed + 1;
+
       await sendLocalNotification(
-        '✅ Data Berhasil Disimpan',
-        `Foto tersimpan ke Supabase.\nLat: ${marker.latitude.toFixed(6)}\nLng: ${marker.longitude.toFixed(6)}`,
+        firestoreOk ? 'Firebase Sync Success' : 'Firebase Sync Failed',
+        `Firestore: ${fsSuccess} successful, ${fsFailed} unsuccessful.\nFCM: ${fcmSuccess + 1} successful, ${fcmFailed} unsuccessful.\nLat: ${marker.latitude.toFixed(6)}, Lng: ${marker.longitude.toFixed(6)}`,
         {
           latitude: String(marker.latitude),
           longitude: String(marker.longitude),
-          image_url: imageUrl,
         }
       );
 
-      Alert.alert('Success', 'Photo and location saved successfully');
+      dispatch(incrementFcmSuccess());
+    } catch {
+      dispatch(incrementFcmFailed());
+    }
 
-    } catch (error: any) {
+    setLoading(false);
 
-      // Kirim notifikasi gagal via Firebase
-      await sendLocalNotification(
-        '❌ Data Gagal Disimpan',
-        `Error: ${error.message}\nLat: ${marker?.latitude.toFixed(6) ?? '-'}\nLng: ${marker?.longitude.toFixed(6) ?? '-'}`,
-        {
-          latitude: String(marker?.latitude ?? ''),
-          longitude: String(marker?.longitude ?? ''),
-          error: error.message,
-        }
-      );
-
-      Alert.alert('Error', error.message);
-
-    } finally {
-      setLoading(false);
+    if (firestoreOk) {
+      Alert.alert('Success', 'Data berhasil disimpan!');
+    } else {
+      Alert.alert('Error', 'Gagal menyimpan data.');
     }
   };
-
-  const region: Region | undefined = location
-    ? {
-        latitude: location.latitude,
-        longitude: location.longitude,
-        latitudeDelta: 0.01,
-        longitudeDelta: 0.01,
-      }
-    : undefined;
 
   return (
     <View style={styles.container}>
@@ -170,42 +209,45 @@ const HomeScreen = () => {
         </View>
       ) : (
         <>
-          <MapView
+          <WebView
             style={styles.map}
-            initialRegion={region}
-            onPress={(e) => setMarker(e.nativeEvent.coordinate)}
-          >
-            <UrlTile
-              urlTemplate="https://a.tile.openstreetmap.org/{z}/{x}/{y}.png"
-              maximumZ={19}
-              zIndex={1}
-            />
-            {marker && (
-              <Marker
-                coordinate={marker}
-                title="Photo Location"
-                draggable
-                onDragEnd={(e) => setMarker(e.nativeEvent.coordinate)}
-              />
-            )}
-          </MapView>
+            originWhitelist={['*']}
+            source={{ html: buildLeafletHTML(location.latitude, location.longitude) }}
+            onMessage={(event) => {
+              try {
+                const coords = JSON.parse(event.nativeEvent.data);
+                setMarker(coords);
+              } catch {}
+            }}
+            javaScriptEnabled
+          />
 
           <ScrollView style={styles.info}>
-            <Text style={styles.sectionTitle}>📍 Device Location</Text>
+            <Text style={styles.sectionTitle}>Device Location</Text>
             <Text style={styles.coordText}>Latitude: {location.latitude}</Text>
             <Text style={styles.coordText}>Longitude: {location.longitude}</Text>
 
-            <Text style={[styles.sectionTitle, { marginTop: 12 }]}>📌 Marker Position</Text>
+            <Text style={[styles.sectionTitle, { marginTop: 12 }]}>Marker Position</Text>
             <Text style={styles.coordText}>Latitude: {marker?.latitude ?? '-'}</Text>
             <Text style={styles.coordText}>Longitude: {marker?.longitude ?? '-'}</Text>
 
+            <View style={styles.statsBox}>
+              <Text style={styles.statsTitle}>Firebase Stats (Session)</Text>
+              <Text style={styles.statsText}>
+                Firestore: {firestoreSuccess} successful, {firestoreFailed} unsuccessful
+              </Text>
+              <Text style={styles.statsText}>
+                FCM: {fcmSuccess} successful, {fcmFailed} unsuccessful
+              </Text>
+            </View>
+
             <View style={styles.button}>
-              <Button title="📷 Open Camera" onPress={openCamera} />
+              <Button title="Open Camera" onPress={openCamera} />
             </View>
 
             <View style={styles.button}>
               <Button
-                title={loading ? 'Saving...' : '💾 Save To Supabase'}
+                title={loading ? 'Saving...' : 'Save To Supabase'}
                 onPress={saveData}
                 disabled={loading}
               />
@@ -231,6 +273,16 @@ const styles = StyleSheet.create({
   info: { flex: 1, padding: 16, backgroundColor: '#fff' },
   sectionTitle: { fontSize: 15, fontWeight: '600', color: '#374151' },
   coordText: { fontSize: 13, color: '#6b7280', marginTop: 2 },
+  statsBox: {
+    marginTop: 12,
+    padding: 12,
+    backgroundColor: '#f0f4ff',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#c7d7ff',
+  },
+  statsTitle: { fontSize: 14, fontWeight: '700', color: '#1e3a8a', marginBottom: 4 },
+  statsText: { fontSize: 13, color: '#374151', marginTop: 2 },
   button: { marginTop: 10 },
   image: { width: 220, height: 220, marginTop: 15, borderRadius: 10, alignSelf: 'center' },
 });
